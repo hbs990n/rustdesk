@@ -1,0 +1,232 @@
+name: Build Android APK Only
+
+on:
+  workflow_dispatch:  # 这行保证有手动运行按钮
+  push:
+    branches: [main, master]
+    paths:
+      - 'flutter/**'
+      - 'libs/**'
+      - '**.dart'
+      - '**.rs'
+      - 'Cargo.toml'
+      - '.github/workflows/android-build.yml'
+  pull_request:
+    branches: [main, master]
+
+env:
+  RUST_VERSION: "1.75"
+  CARGO_NDK_VERSION: "3.1.2"
+  ANDROID_FLUTTER_VERSION: "3.24.5"
+  NDK_VERSION: "r27c"
+  VERSION: "1.4.4"
+  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
+
+jobs:
+  generate-bridge:
+    uses: ./.github/workflows/bridge.yml
+
+  build-android-all:
+    name: Build Android APKs
+    needs: [generate-bridge]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target-config:
+          - {
+              arch: aarch64,
+              target: aarch64-linux-android,
+              android_target: arm64-v8a,
+              platform: android-arm64,
+              output_suffix: "",
+            }
+          - {
+              arch: armv7,
+              target: armv7-linux-androideabi,
+              android_target: armeabi-v7a,
+              platform: android-arm,
+              output_suffix: "",
+            }
+          - {
+              arch: x86_64,
+              target: x86_64-linux-android,
+              android_target: x86_64,
+              platform: android-x64,
+              output_suffix: "",
+            }
+    
+    steps:
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: false
+          dotnet: true
+          docker-images: true
+      
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      
+      - name: Install flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ env.ANDROID_FLUTTER_VERSION }}
+      
+      - name: Patch flutter
+        run: |
+          cd $(dirname $(dirname $(which flutter)))
+          [[ "3.24.5" == ${{env.ANDROID_FLUTTER_VERSION}} ]] && git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
+      
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+      
+      - name: Restore bridge files
+        uses: actions/download-artifact@master
+        with:
+          name: bridge-artifact
+          path: ./
+      
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          components: "rustfmt"
+      
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: rustdesk-android-lib-cache
+      
+      - name: Build Android dependencies
+        shell: bash
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          echo "Building dependencies for ${{ matrix.target-config.android_target }}"
+          ./flutter/build_android_deps.sh "${{ matrix.target-config.android_target }}" || {
+            echo "Failed to build dependencies"
+            exit 1
+          }
+      
+      - name: Build Rust library
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          rustup target add ${{ matrix.target-config.target }}
+          cargo install cargo-ndk --version ${{ env.CARGO_NDK_VERSION }} --locked
+          
+          # 根据架构执行不同的构建脚本
+          case "${{ matrix.target-config.target }}" in
+            aarch64-linux-android)
+              ./flutter/ndk_arm64.sh
+            ;;
+            armv7-linux-androideabi)
+              ./flutter/ndk_arm.sh
+            ;;
+            x86_64-linux-android)
+              ./flutter/ndk_x64.sh
+            ;;
+          esac
+          
+          # 复制库文件到 Flutter 目录
+          mkdir -p ./flutter/android/app/src/main/jniLibs/${{ matrix.target-config.android_target }}
+          cp ./target/${{ matrix.target-config.target }}/release/liblibrustdesk.so \
+             ./flutter/android/app/src/main/jniLibs/${{ matrix.target-config.android_target }}/librustdesk.so
+      
+      - name: Build APK
+        env:
+          JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          export PATH=/usr/lib/jvm/java-17-openjdk-amd64/bin:$PATH
+          
+          # 设置 Gradle 内存限制
+          sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g" ./flutter/android/gradle.properties
+          
+          # 使用 debug 签名配置（因为没有签名密钥）
+          sed -i "s/signingConfigs.release/signingConfigs.debug/g" ./flutter/android/app/build.gradle
+          
+          # 复制必要的共享库
+          cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${{ matrix.target-config.target }}/libc++_shared.so \
+             ./flutter/android/app/src/main/jniLibs/${{ matrix.target-config.android_target }}/
+          
+          # 构建 APK
+          cd flutter
+          flutter build apk --release \
+            --target-platform ${{ matrix.target-config.platform }} \
+            --split-per-abi
+          
+          # 重命名 APK 文件
+          mv build/app/outputs/flutter-apk/app-${{ matrix.target-config.android_target }}-release.apk \
+             ../rustdesk-${{ env.VERSION }}-${{ matrix.target-config.arch }}${{ matrix.target-config.output_suffix }}.apk
+      
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rustdesk-android-${{ matrix.target-config.arch }}
+          path: rustdesk-${{ env.VERSION }}-${{ matrix.target-config.arch }}${{ matrix.target-config.output_suffix }}.apk
+          retention-days: 7
+      
+      - name: Create universal APK (仅对 aarch64 架构)
+        if: matrix.target-config.arch == 'aarch64'
+        runs-on: ubuntu-24.04
+        needs: build-android-all
+        steps:
+          - name: Download all APKs
+            uses: actions/download-artifact@v4
+            with:
+              path: downloaded-apks
+          
+          - name: Prepare for universal build
+            run: |
+              # 复制所有架构的库文件
+              mkdir -p flutter/android/app/src/main/jniLibs
+              
+              # 这里需要实际从各个架构构建中获取库文件
+              # 简化版本：只构建通用 APK
+              echo "Universal APK would combine all architectures"
+          
+          - name: Upload universal APK info
+            run: |
+              echo "Universal APK requires combining all architectures"
+              echo "See the original workflow for complete implementation"
+
+  create-release:
+    name: Create Release with APKs
+    needs: [build-android-all]
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all APK artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: apks
+      
+      - name: List downloaded files
+        run: ls -la apks/
+      
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: android-build-$(date +%Y%m%d-%H%M%S)
+          name: "Android Build $(date +%Y-%m-%d)"
+          body: |
+            Android APKs built from RustDesk
+            - Built at: $(date)
+            - Commit: ${{ github.sha }}
+            - Flutter: ${{ env.ANDROID_FLUTTER_VERSION }}
+            - Rust: ${{ env.RUST_VERSION }}
+          files: |
+            apks/**/*.apk
+          prerelease: true
+          generate_release_notes: false
