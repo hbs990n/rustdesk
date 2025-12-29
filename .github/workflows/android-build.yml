@@ -1,4 +1,4 @@
-name: Build Android ARM64 Only
+name: Build Android ARM64 (Single Arch)
 
 on:
   workflow_dispatch:
@@ -7,8 +7,6 @@ on:
     paths:
       - 'flutter/**'
       - 'libs/**'
-      - '**.dart'
-      - '**.rs'
 
 env:
   RUST_VERSION: "1.75"
@@ -26,7 +24,7 @@ jobs:
     name: Build Android ARM64 APK
     needs: [generate-bridge]
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 35
     
     steps:
       - name: Checkout source code
@@ -41,44 +39,24 @@ jobs:
           ndk-version: ${{ env.NDK_VERSION }}
           add-to-path: true
       
-      - name: Install basic dependencies
+      - name: Setup vcpkg with cache (官方方式)
+        uses: lukka/run-vcpkg@v11
+        id: setup-vcpkg
+        with:
+          vcpkgDirectory: /opt/artifacts/vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+      
+      - name: Install basic tools
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-               clang cmake curl git \
+               clang cmake \
                g++ g++-multilib \
                libclang-dev \
                nasm ninja-build \
                openjdk-17-jdk-headless \
-               pkg-config python3 python3-pip tar unzip wget
-      
-      - name: Install vcpkg manually
-        id: install-vcpkg
-        run: |
-          echo "Installing vcpkg..."
-          VCPKG_ROOT="/opt/vcpkg"
-          echo "VCPKG_ROOT=${VCPKG_ROOT}" >> $GITHUB_ENV
-          
-          # 创建目录
-          sudo mkdir -p /opt
-          sudo chmod 777 /opt
-          
-          # 克隆 vcpkg
-          cd /opt
-          git clone https://github.com/microsoft/vcpkg.git
-          cd vcpkg
-          
-          # 切换到指定提交
-          git checkout ${{ env.VCPKG_COMMIT_ID }}
-          
-          # 引导 vcpkg
-          ./bootstrap-vcpkg.sh -disableMetrics
-          
-          echo "VCPKG installed at: $(pwd)"
-          echo "vcpkg path: $(pwd)/vcpkg"
-          
-          # 添加到 PATH
-          echo "$(pwd)" >> $GITHUB_PATH
+               pkg-config wget
       
       - name: Install flutter
         uses: subosito/flutter-action@v2
@@ -98,123 +76,85 @@ jobs:
           toolchain: ${{ env.RUST_VERSION }}
           components: "rustfmt"
       
-      - name: Build Android dependencies - 简化版
-        env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
-          VCPKG_ROOT: /opt/vcpkg
+      - name: Set environment variables
         run: |
-          echo "VCPKG_ROOT: $VCPKG_ROOT"
-          echo "vcpkg executable: $VCPKG_ROOT/vcpkg"
-          ls -la $VCPKG_ROOT/ || true
-          
-          echo "🔧 安装 arm64-android 依赖..."
-          
-          # 直接使用 vcpkg 安装依赖
-          $VCPKG_ROOT/vcpkg install \
-            --triplet arm64-android \
-            ffmpeg \
-            libvpx \
-            libyuv \
-            opus \
-            x264 \
-            x265
-          
-          echo "✅ 依赖安装完成"
+          echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+          echo "VCPKG_ROOT=/opt/artifacts/vcpkg" >> $GITHUB_ENV
+          echo "Environment variables set:"
+          echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}"
+          echo "VCPKG_ROOT=/opt/artifacts/vcpkg"
       
-      - name: Build Rust library for ARM64
-        env:
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+      - name: Build Android dependencies for arm64-v8a
         run: |
-          echo "🔨 构建 ARM64 Rust 库..."
+          echo "=== 构建安卓依赖 (arm64-v8a) ==="
+          echo "ANDROID_NDK_HOME: $ANDROID_NDK_HOME"
+          echo "VCPKG_ROOT: $VCPKG_ROOT"
+          echo "vcpkg路径: $VCPKG_ROOT/vcpkg"
           
-          # 添加目标架构
-          rustup target add aarch64-linux-android
+          # 检查vcpkg是否存在
+          if [ -f "$VCPKG_ROOT/vcpkg" ]; then
+            echo "✅ vcpkg找到: $VCPKG_ROOT/vcpkg"
+          else
+            echo "❌ vcpkg未找到"
+            ls -la /opt/artifacts/ || true
+            exit 1
+          fi
           
-          # 安装 cargo-ndk
+          # 运行构建脚本
+          chmod +x ./flutter/build_android_deps.sh
+          ./flutter/build_android_deps.sh "arm64-v8a"
+          echo "✅ 依赖构建完成"
+      
+      - name: Build Rust library
+        run: |
+          echo "=== 构建Rust库 (ARM64) ==="
+          
+          # 安装cargo-ndk
           cargo install cargo-ndk --version ${{ env.CARGO_NDK_VERSION }}
           
-          echo "设置环境变量..."
-          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang"
-          export CC_aarch64_linux_android="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang"
-          export CXX_aarch64_linux_android="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android34-clang++"
+          # 运行构建脚本
+          chmod +x ./flutter/ndk_arm64.sh
+          ./flutter/ndk_arm64.sh
           
-          echo "构建 librustdesk.so..."
-          cd libs
-          cargo ndk \
-            --target aarch64-linux-android \
-            --platform 34 \
-            -- build --release --features flutter,hwcodec
-          
-          # 检查是否构建成功
-          if [ -f "../target/aarch64-linux-android/release/liblibrustdesk.so" ]; then
-            echo "✅ Rust 库构建成功"
-            # 复制到 Flutter 目录
-            mkdir -p ../flutter/android/app/src/main/jniLibs/arm64-v8a
-            cp ../target/aarch64-linux-android/release/liblibrustdesk.so \
-               ../flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
-            ls -la ../flutter/android/app/src/main/jniLibs/arm64-v8a/
+          # 检查构建结果
+          if [ -f "target/aarch64-linux-android/release/liblibrustdesk.so" ]; then
+            echo "✅ Rust库构建成功"
+            # 复制到Flutter目录
+            mkdir -p flutter/android/app/src/main/jniLibs/arm64-v8a
+            cp target/aarch64-linux-android/release/liblibrustdesk.so \
+               flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
           else
-            echo "❌ Rust 库未找到!"
-            echo "查找文件..."
-            find ../target -name "*.so" -type f | head -20
+            echo "❌ Rust库未找到"
+            find target -name "*.so" -type f
             exit 1
           fi
       
       - name: Build Flutter APK
         env:
           JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
-          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
+          echo "=== 构建Flutter APK ==="
           export PATH=$JAVA_HOME/bin:$PATH
           
-          echo "📱 构建 Flutter APK..."
-          
-          # 复制必要的共享库
+          # 复制libc++_shared.so
           CXX_SHARED="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
           if [ -f "$CXX_SHARED" ]; then
-            mkdir -p flutter/android/app/src/main/jniLibs/arm64-v8a
             cp "$CXX_SHARED" flutter/android/app/src/main/jniLibs/arm64-v8a/
-            echo "复制 libc++_shared.so"
           fi
           
-          # 配置 Gradle 使用更多内存
-          if [ -f "flutter/android/gradle.properties" ]; then
-            echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g" >> flutter/android/gradle.properties
-          fi
-          
-          # 进入 Flutter 目录
+          # 进入Flutter目录构建
           cd flutter
+          flutter build apk --release --target-platform android-arm64 --split-per-abi
           
-          # 清理并获取依赖
-          flutter clean
-          flutter pub get
-          
-          echo "Flutter 医生检查..."
-          flutter doctor -v
-          
-          # 构建 APK（使用 debug 签名）
-          echo "开始构建 APK..."
-          flutter build apk --release \
-            --target-platform android-arm64 \
-            --no-tree-shake-icons
-          
-          # 检查构建结果
-          echo "构建输出文件:"
-          ls -la build/app/outputs/flutter-apk/
-          
-          # 重命名文件
-          APK_FILE="build/app/outputs/flutter-apk/app-arm64-v8a-release.apk"
-          if [ -f "$APK_FILE" ]; then
-            FINAL_APK="../rustdesk-${{ env.VERSION }}-arm64.apk"
-            mv "$APK_FILE" "$FINAL_APK"
-            echo "✅ APK 创建成功: $(basename $FINAL_APK)"
-            echo "文件大小: $(du -h $FINAL_APK | cut -f1)"
+          # 重命名APK
+          if [ -f "build/app/outputs/flutter-apk/app-arm64-v8a-release.apk" ]; then
+            mv build/app/outputs/flutter-apk/app-arm64-v8a-release.apk \
+               ../rustdesk-${{ env.VERSION }}-arm64.apk
+            echo "✅ APK构建完成: rustdesk-${{ env.VERSION }}-arm64.apk"
           else
-            echo "❌ APK 文件未找到!"
-            echo "尝试查找其他 APK 文件..."
-            find build/app/outputs -name "*.apk" -type f
+            echo "❌ APK文件未找到"
+            ls -la build/app/outputs/flutter-apk/
             exit 1
           fi
       
@@ -226,13 +166,10 @@ jobs:
           retention-days: 7
         if: success()
       
-      - name: Build summary
-        if: always()
+      - name: Display success message
+        if: success()
         run: |
-          echo "========================================"
-          echo "📊 构建总结"
-          echo "========================================"
-          echo "✅ 工作流: Build Android ARM64 Only"
-          echo "📱 架构: arm64-v8a (现代安卓手机)"
-          echo "🕒 状态: ${{ job.status }}"
-          echo "========================================"
+          echo "🎉 构建成功！"
+          echo "📱 APK文件: rustdesk-${{ env.VERSION }}-arm64.apk"
+          echo "🏗️  架构: arm64-v8a (现代安卓手机)"
+          echo "📦 可在Artifacts中下载"
