@@ -166,38 +166,14 @@ jobs:
           
           # 重命名 APK 文件
           mv build/app/outputs/flutter-apk/app-${{ matrix.target-config.android_target }}-release.apk \
-             ../rustdesk-${{ env.VERSION }}-${{ matrix.target-config.arch }}${{ matrix.target-config.output_suffix }}.apk
+             ../rustdesk-${{ env.VERSION }}-${{ matrix.target-config.arch }}.apk
       
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: rustdesk-android-${{ matrix.target-config.arch }}
-          path: rustdesk-${{ env.VERSION }}-${{ matrix.target-config.arch }}${{ matrix.target-config.output_suffix }}.apk
+          path: rustdesk-${{ env.VERSION }}-${{ matrix.target-config.arch }}.apk
           retention-days: 7
-      
-      - name: Create universal APK (仅对 aarch64 架构)
-        if: matrix.target-config.arch == 'aarch64'
-        runs-on: ubuntu-24.04
-        needs: build-android-all
-        steps:
-          - name: Download all APKs
-            uses: actions/download-artifact@v4
-            with:
-              path: downloaded-apks
-          
-          - name: Prepare for universal build
-            run: |
-              # 复制所有架构的库文件
-              mkdir -p flutter/android/app/src/main/jniLibs
-              
-              # 这里需要实际从各个架构构建中获取库文件
-              # 简化版本：只构建通用 APK
-              echo "Universal APK would combine all architectures"
-          
-          - name: Upload universal APK info
-            run: |
-              echo "Universal APK requires combining all architectures"
-              echo "See the original workflow for complete implementation"
 
   create-release:
     name: Create Release with APKs
