@@ -1,4 +1,4 @@
-name: Build Android ARM64 (Safe Clean)
+name: Build Android ARM64 (Final)
 
 on:
   workflow_dispatch:
@@ -14,6 +14,7 @@ env:
   ANDROID_FLUTTER_VERSION: "3.24.5"
   NDK_VERSION: "r27c"
   VERSION: "1.4.4"
+  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
 
 jobs:
   generate-bridge:
@@ -23,16 +24,9 @@ jobs:
     name: Build Android ARM64 APK
     needs: [generate-bridge]
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 45
     
     steps:
-      - name: Check disk space before cleanup
-        run: |
-          echo "=== 清理前磁盘使用 ==="
-          df -h
-          echo "Home目录使用:"
-          du -sh ~/ 2>/dev/null | head -5 || true
-      
       - name: Checkout with submodules
         uses: actions/checkout@v4
         with:
@@ -45,32 +39,6 @@ jobs:
           ndk-version: ${{ env.NDK_VERSION }}
           add-to-path: true
       
-      - name: Safe disk cleanup (不清理关键缓存)
-        run: |
-          echo "=== 安全磁盘清理 ==="
-          
-          # 1. 只清理APT下载缓存（不影响已安装的包）
-          sudo apt-get clean
-          echo "✅ 清理APT下载缓存"
-          
-          # 2. 清理系统临时文件（安全）
-          sudo rm -rf /tmp/.* 2>/dev/null || true  # 隐藏文件
-          echo "✅ 清理/tmp隐藏文件"
-          
-          # 3. 清理runner工作目录的临时文件
-          find "${{ github.workspace }}" -name "*.tmp" -delete 2>/dev/null || true
-          find "${{ github.workspace }}" -name "*.temp" -delete 2>/dev/null || true
-          echo "✅ 清理工作区临时文件"
-          
-          # 4. 清理Docker（如果存在且不需要）
-          if command -v docker &> /dev/null && [ -z "$DOCKER_REQUIRED" ]; then
-            sudo docker system prune -af 2>/dev/null || true
-            echo "✅ 清理Docker"
-          fi
-          
-          echo "清理后磁盘使用:"
-          df -h
-      
       - name: Setup vcpkg with cache
         uses: lukka/run-vcpkg@v11
         id: setup-vcpkg
@@ -79,29 +47,23 @@ jobs:
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
           doNotCache: false
       
-      - name: Install minimal required packages
+      - name: Install required packages
         run: |
-          echo "安装必要包..."
           sudo apt-get update
-          # 只安装构建必需的最小包集
           sudo apt-get install -y \
                clang cmake \
                g++ \
                libclang-dev \
                nasm ninja-build \
                openjdk-17-jdk-headless \
-               pkg-config
-          # 不安装推荐包，减少空间
-          sudo apt-get install --no-install-recommends -y
+               pkg-config wget
       
-      - name: Install flutter with cache
+      - name: Install flutter
         uses: subosito/flutter-action@v2
         with:
           channel: "stable"
           flutter-version: ${{ env.ANDROID_FLUTTER_VERSION }}
           cache: true
-          cache-key: flutter-${{ env.ANDROID_FLUTTER_VERSION }}
-          cache-path: ${{ runner.tool_cache }}/flutter
       
       - name: Restore bridge files
         uses: actions/download-artifact@master
@@ -109,75 +71,96 @@ jobs:
           name: bridge-artifact
           path: ./
       
-      - name: Install Rust with cache
+      - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: "rustfmt"
       
-      - name: Setup Rust cache (保护编译缓存)
+      - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: rustdesk-android-arm64
-          key: ${{ env.RUST_VERSION }}-aarch64
-          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+          prefix-key: rustdesk-android-final
+          key: aarch64-${{ env.RUST_VERSION }}
       
       - name: Set environment variables
         run: |
           echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+          echo "ANDROID_NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
           echo "VCPKG_ROOT=/opt/artifacts/vcpkg" >> $GITHUB_ENV
+          echo "环境变量设置完成"
       
-      - name: Try install cargo-ndk with multiple attempts
+      - name: Install cargo-ndk
         run: |
-          echo "尝试安装 cargo-ndk..."
-          
-          # 方法1: 使用官方工作流的方法
-          if cargo install cargo-ndk --version ${{ env.CARGO_NDK_VERSION }} --locked; then
-            echo "✅ 方法1成功"
-          else
-            echo "方法1失败，尝试方法2..."
-            # 方法2: 使用旧版本
-            cargo install cargo-ndk --version "2.8.0" --locked && echo "✅ 方法2成功" || {
-              echo "方法2失败，尝试方法3..."
-              # 方法3: 从源码编译指定版本
-              cargo install --git https://github.com/bbqsrc/cargo-ndk --tag v${{ env.CARGO_NDK_VERSION }} --locked
-            }
-          fi
-          
-          cargo-ndk --version
+          echo "安装 cargo-ndk..."
+          cargo install cargo-ndk --version ${{ env.CARGO_NDK_VERSION }} --locked
+          echo "✅ cargo-ndk 安装成功"
+          # 验证安装
+          cargo ndk --version
       
-      - name: Build with cleanup between steps
+      - name: Build Android dependencies
         run: |
-          echo "=== 开始构建 ==="
+          echo "构建安卓依赖..."
+          echo "检查vcpkg: $VCPKG_ROOT/vcpkg"
+          ls -la $VCPKG_ROOT/vcpkg || echo "vcpkg未找到"
           
-          # 构建依赖
           chmod +x ./flutter/build_android_deps.sh
           ./flutter/build_android_deps.sh "arm64-v8a"
-          
-          # 清理vcpkg源码以释放空间
-          rm -rf /opt/artifacts/vcpkg/buildtrees/*/src 2>/dev/null || true
-          
-          echo "依赖构建后磁盘:"
-          df -h
+          echo "✅ 依赖构建完成"
       
-      - name: Build Rust library
+      - name: Build Rust library (修复调用方式)
         run: |
+          echo "构建Rust库..."
+          
+          # 添加目标架构
           rustup target add aarch64-linux-android
           
-          # 清理旧的目标文件但不删除缓存
-          if [ -d "target/aarch64-linux-android" ]; then
-            # 只删除release目录中的中间文件
-            find target/aarch64-linux-android/release -name "*.o" -delete 2>/dev/null || true
-            find target/aarch64-linux-android/release -name "*.d" -delete 2>/dev/null || true
+          # 方法1: 使用cargo ndk命令（正确方式）
+          echo "方法1: 使用 cargo ndk 命令"
+          cd libs
+          cargo ndk --platform 21 --target aarch64-linux-android build --release --features flutter,hwcodec
+          
+          # 检查构建结果
+          if [ -f "../target/aarch64-linux-android/release/liblibrustdesk.so" ]; then
+            echo "✅ Rust库构建成功"
+            # 复制到Flutter目录
+            mkdir -p ../flutter/android/app/src/main/jniLibs/arm64-v8a
+            cp ../target/aarch64-linux-android/release/liblibrustdesk.so \
+               ../flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
+          else
+            echo "❌ 方法1失败，尝试方法2..."
+            # 方法2: 直接运行ndk_arm64.sh脚本
+            cd ..
+            chmod +x ./flutter/ndk_arm64.sh
+            ./flutter/ndk_arm64.sh
+            
+            if [ -f "target/aarch64-linux-android/release/liblibrustdesk.so" ]; then
+              echo "✅ 方法2成功"
+              mkdir -p flutter/android/app/src/main/jniLibs/arm64-v8a
+              cp target/aarch64-linux-android/release/liblibrustdesk.so \
+                 flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
+            else
+              echo "❌ 所有方法都失败"
+              exit 1
+            fi
           fi
           
-          chmod +x ./flutter/ndk_arm64.sh
-          ./flutter/ndk_arm64.sh
+          echo "库文件位置:"
+          ls -lh flutter/android/app/src/main/jniLibs/arm64-v8a/
+      
+      - name: Prepare for Flutter build
+        run: |
+          echo "准备Flutter构建..."
           
-          # 复制库文件
-          mkdir -p flutter/android/app/src/main/jniLibs/arm64-v8a
-          cp target/aarch64-linux-android/release/liblibrustdesk.so \
-             flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
+          # 复制libc++_shared.so
+          if [ -f "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" ]; then
+            mkdir -p flutter/android/app/src/main/jniLibs/arm64-v8a
+            cp "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" \
+               flutter/android/app/src/main/jniLibs/arm64-v8a/
+          fi
+          
+          # 设置Gradle内存
+          echo "org.gradle.jvmargs=-Xmx4096m -Dfile.encoding=UTF-8" >> flutter/android/gradle.properties
       
       - name: Build Flutter APK
         env:
@@ -185,14 +168,54 @@ jobs:
         run: |
           export PATH=$JAVA_HOME/bin:$PATH
           
-          cd flutter
-          flutter build apk --release --target-platform android-arm64 --split-per-abi
+          echo "构建Flutter APK..."
           
-          mv build/app/outputs/flutter-apk/app-arm64-v8a-release.apk \
-             ../rustdesk-${{ env.VERSION }}-arm64.apk
+          cd flutter
+          
+          # 清理并获取依赖
+          flutter clean
+          flutter pub get
+          
+          # 构建APK
+          flutter build apk --release \
+            --target-platform android-arm64 \
+            --split-per-abi \
+            --no-tree-shake-icons
+          
+          # 检查结果
+          echo "构建输出:"
+          ls -la build/app/outputs/flutter-apk/
+          
+          # 重命名APK
+          APK_SOURCE="build/app/outputs/flutter-apk/app-arm64-v8a-release.apk"
+          APK_DEST="../rustdesk-${{ env.VERSION }}-arm64.apk"
+          
+          if [ -f "$APK_SOURCE" ]; then
+            mv "$APK_SOURCE" "$APK_DEST"
+            echo "✅ APK构建成功: $(basename $APK_DEST)"
+            echo "文件大小: $(du -h $APK_DEST | cut -f1)"
+          else
+            echo "❌ APK文件未找到"
+            # 尝试查找其他APK文件
+            find build/app/outputs -name "*.apk" -type f
+            exit 1
+          fi
       
-      - name: Upload APK
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: rustdesk-android-arm64
           path: rustdesk-${{ env.VERSION }}-arm64.apk
+          retention-days: 7
+      
+      - name: Display success message
+        if: success()
+        run: |
+          echo ""
+          echo "🎉🎉🎉 构建成功！ 🎉🎉🎉"
+          echo "========================================"
+          echo "📱 Android ARM64 APK 已生成"
+          echo "📦 文件: rustdesk-${{ env.VERSION }}-arm64.apk"
+          echo "🏗️  架构: arm64-v8a (现代安卓手机)"
+          echo "📥 可在Artifacts中下载"
+          echo "========================================"
