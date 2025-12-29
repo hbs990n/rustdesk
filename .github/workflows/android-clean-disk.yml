@@ -1,4 +1,4 @@
-name: Build Android ARM64 (Clean Disk)
+name: Build Android ARM64 (Safe Clean)
 
 on:
   workflow_dispatch:
@@ -14,7 +14,6 @@ env:
   ANDROID_FLUTTER_VERSION: "3.24.5"
   NDK_VERSION: "r27c"
   VERSION: "1.4.4"
-  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
 
 jobs:
   generate-bridge:
@@ -24,41 +23,15 @@ jobs:
     name: Build Android ARM64 APK
     needs: [generate-bridge]
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 40
     
     steps:
-      # 第一步：清理磁盘空间（关键！）
-      - name: Clean disk space before build
+      - name: Check disk space before cleanup
         run: |
-          echo "=== 清理磁盘空间 ==="
-          echo "清理前磁盘使用情况："
+          echo "=== 清理前磁盘使用 ==="
           df -h
-          
-          # 清理APT缓存
-          sudo apt-get clean
-          sudo apt-get autoclean
-          
-          # 删除不必要的包
-          sudo apt-get autoremove -y
-          
-          # 清理临时文件
-          sudo rm -rf /tmp/*
-          sudo rm -rf /var/tmp/*
-          
-          # 清理日志文件（保留最近7天）
-          sudo find /var/log -type f -name "*.log" -mtime +7 -delete
-          sudo find /var/log -type f -name "*.gz" -delete
-          
-          # 清理Docker镜像（如果有）
-          if command -v docker &> /dev/null; then
-            sudo docker system prune -af 2>/dev/null || true
-          fi
-          
-          # 清理Flutter缓存（如果存在）
-          rm -rf ~/.pub-cache 2>/dev/null || true
-          
-          echo "清理后磁盘使用情况："
-          df -h
+          echo "Home目录使用:"
+          du -sh ~/ 2>/dev/null | head -5 || true
       
       - name: Checkout with submodules
         uses: actions/checkout@v4
@@ -72,6 +45,32 @@ jobs:
           ndk-version: ${{ env.NDK_VERSION }}
           add-to-path: true
       
+      - name: Safe disk cleanup (不清理关键缓存)
+        run: |
+          echo "=== 安全磁盘清理 ==="
+          
+          # 1. 只清理APT下载缓存（不影响已安装的包）
+          sudo apt-get clean
+          echo "✅ 清理APT下载缓存"
+          
+          # 2. 清理系统临时文件（安全）
+          sudo rm -rf /tmp/.* 2>/dev/null || true  # 隐藏文件
+          echo "✅ 清理/tmp隐藏文件"
+          
+          # 3. 清理runner工作目录的临时文件
+          find "${{ github.workspace }}" -name "*.tmp" -delete 2>/dev/null || true
+          find "${{ github.workspace }}" -name "*.temp" -delete 2>/dev/null || true
+          echo "✅ 清理工作区临时文件"
+          
+          # 4. 清理Docker（如果存在且不需要）
+          if command -v docker &> /dev/null && [ -z "$DOCKER_REQUIRED" ]; then
+            sudo docker system prune -af 2>/dev/null || true
+            echo "✅ 清理Docker"
+          fi
+          
+          echo "清理后磁盘使用:"
+          df -h
+      
       - name: Setup vcpkg with cache
         uses: lukka/run-vcpkg@v11
         id: setup-vcpkg
@@ -80,11 +79,11 @@ jobs:
           vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
           doNotCache: false
       
-      - name: Install minimal tools only
+      - name: Install minimal required packages
         run: |
-          echo "=== 安装最小化工具集 ==="
+          echo "安装必要包..."
           sudo apt-get update
-          # 只安装必要的包
+          # 只安装构建必需的最小包集
           sudo apt-get install -y \
                clang cmake \
                g++ \
@@ -92,14 +91,17 @@ jobs:
                nasm ninja-build \
                openjdk-17-jdk-headless \
                pkg-config
+          # 不安装推荐包，减少空间
+          sudo apt-get install --no-install-recommends -y
       
-      - name: Install flutter
+      - name: Install flutter with cache
         uses: subosito/flutter-action@v2
         with:
           channel: "stable"
           flutter-version: ${{ env.ANDROID_FLUTTER_VERSION }}
           cache: true
           cache-key: flutter-${{ env.ANDROID_FLUTTER_VERSION }}
+          cache-path: ${{ runner.tool_cache }}/flutter
       
       - name: Restore bridge files
         uses: actions/download-artifact@master
@@ -107,75 +109,75 @@ jobs:
           name: bridge-artifact
           path: ./
       
-      - name: Install Rust toolchain
+      - name: Install Rust with cache
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: ${{ env.RUST_VERSION }}
           components: "rustfmt"
       
-      - name: Setup Rust cache
+      - name: Setup Rust cache (保护编译缓存)
         uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: rustdesk-android
-          key: aarch64-linux-android
+          prefix-key: rustdesk-android-arm64
+          key: ${{ env.RUST_VERSION }}-aarch64
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
       
       - name: Set environment variables
         run: |
           echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
           echo "VCPKG_ROOT=/opt/artifacts/vcpkg" >> $GITHUB_ENV
       
-      - name: Clean Rust target before build
+      - name: Try install cargo-ndk with multiple attempts
         run: |
-          echo "清理Rust target目录..."
-          # 只保留release目录，删除其他构建
-          if [ -d "target" ]; then
-            find target -name "debug" -type d -exec rm -rf {} + 2>/dev/null || true
-            find target -name "*.rlib" -delete 2>/dev/null || true
-            find target -name "*.d" -delete 2>/dev/null || true
+          echo "尝试安装 cargo-ndk..."
+          
+          # 方法1: 使用官方工作流的方法
+          if cargo install cargo-ndk --version ${{ env.CARGO_NDK_VERSION }} --locked; then
+            echo "✅ 方法1成功"
+          else
+            echo "方法1失败，尝试方法2..."
+            # 方法2: 使用旧版本
+            cargo install cargo-ndk --version "2.8.0" --locked && echo "✅ 方法2成功" || {
+              echo "方法2失败，尝试方法3..."
+              # 方法3: 从源码编译指定版本
+              cargo install --git https://github.com/bbqsrc/cargo-ndk --tag v${{ env.CARGO_NDK_VERSION }} --locked
+            }
           fi
-      
-      - name: Install cargo-ndk
-        run: |
-          echo "安装 cargo-ndk..."
-          # 尝试使用预编译版本或从源码编译
-          cargo install cargo-ndk --version ${{ env.CARGO_NDK_VERSION }} --locked --root /tmp/cargo-install
-          export PATH="/tmp/cargo-install/bin:$PATH"
+          
           cargo-ndk --version
       
-      - name: Build Android dependencies
+      - name: Build with cleanup between steps
         run: |
-          echo "构建安卓依赖..."
+          echo "=== 开始构建 ==="
+          
+          # 构建依赖
           chmod +x ./flutter/build_android_deps.sh
           ./flutter/build_android_deps.sh "arm64-v8a"
+          
+          # 清理vcpkg源码以释放空间
+          rm -rf /opt/artifacts/vcpkg/buildtrees/*/src 2>/dev/null || true
+          
+          echo "依赖构建后磁盘:"
+          df -h
       
       - name: Build Rust library
         run: |
-          echo "构建Rust库..."
           rustup target add aarch64-linux-android
           
-          # 清理旧构建
-          rm -rf target/aarch64-linux-android/release/build 2>/dev/null || true
+          # 清理旧的目标文件但不删除缓存
+          if [ -d "target/aarch64-linux-android" ]; then
+            # 只删除release目录中的中间文件
+            find target/aarch64-linux-android/release -name "*.o" -delete 2>/dev/null || true
+            find target/aarch64-linux-android/release -name "*.d" -delete 2>/dev/null || true
+          fi
           
           chmod +x ./flutter/ndk_arm64.sh
           ./flutter/ndk_arm64.sh
           
-          if [ -f "target/aarch64-linux-android/release/liblibrustdesk.so" ]; then
-            mkdir -p flutter/android/app/src/main/jniLibs/arm64-v8a
-            cp target/aarch64-linux-android/release/liblibrustdesk.so \
-               flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
-          fi
-      
-      - name: Clean intermediate files before Flutter build
-        run: |
-          echo "清理中间文件..."
-          # 清理vcpkg构建文件
-          rm -rf /opt/artifacts/vcpkg/buildtrees/*/src 2>/dev/null || true
-          
-          # 显示剩余空间
-          echo "当前磁盘空间："
-          df -h
-          echo "home目录使用："
-          du -sh ~/ 2>/dev/null || true
+          # 复制库文件
+          mkdir -p flutter/android/app/src/main/jniLibs/arm64-v8a
+          cp target/aarch64-linux-android/release/liblibrustdesk.so \
+             flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
       
       - name: Build Flutter APK
         env:
@@ -184,39 +186,13 @@ jobs:
           export PATH=$JAVA_HOME/bin:$PATH
           
           cd flutter
+          flutter build apk --release --target-platform android-arm64 --split-per-abi
           
-          # 最小化构建
-          flutter build apk --release \
-            --target-platform android-arm64 \
-            --split-per-abi \
-            --no-tree-shake-icons \
-            --shrink
-          
-          if [ -f "build/app/outputs/flutter-apk/app-arm64-v8a-release.apk" ]; then
-            mv build/app/outputs/flutter-apk/app-arm64-v8a-release.apk \
-               ../rustdesk-${{ env.VERSION }}-arm64.apk
-          fi
-      
-      - name: Clean after build
-        run: |
-          echo "构建后清理..."
-          # 删除vcpkg源码
-          rm -rf /opt/artifacts/vcpkg/buildtrees 2>/dev/null || true
-          
-          # 删除Rust构建缓存
-          rm -rf target/aarch64-linux-android/release/build 2>/dev/null || true
-          rm -rf target/aarch64-linux-android/release/deps 2>/dev/null || true
-          
-          # 删除Flutter构建缓存
-          rm -rf flutter/build/app/intermediates 2>/dev/null || true
-          
-          echo "最终磁盘空间："
-          df -h
+          mv build/app/outputs/flutter-apk/app-arm64-v8a-release.apk \
+             ../rustdesk-${{ env.VERSION }}-arm64.apk
       
       - name: Upload APK
         uses: actions/upload-artifact@v4
-        if: success()
         with:
           name: rustdesk-android-arm64
           path: rustdesk-${{ env.VERSION }}-arm64.apk
-          retention-days: 3  # 减少保留时间
