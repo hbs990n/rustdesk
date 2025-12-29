@@ -1,7 +1,7 @@
 name: Build Android APK Only
 
 on:
-  workflow_dispatch:  # 这行保证有手动运行按钮
+  workflow_dispatch:
   push:
     branches: [main, master]
     paths:
@@ -70,6 +70,39 @@ jobs:
         with:
           submodules: recursive
       
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: true
+      
+      - name: Setup vcpkg
+        id: setup-vcpkg
+        run: |
+          VCPKG_ROOT="/opt/artifacts/vcpkg"
+          echo "VCPKG_ROOT=${VCPKG_ROOT}" >> $GITHUB_ENV
+          echo "Setting VCPKG_ROOT to ${VCPKG_ROOT}"
+          mkdir -p /opt/artifacts
+      
+      - name: Setup vcpkg with Github Actions binary cache
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: /opt/artifacts/vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+      
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+               clang cmake curl \
+               gcc-multilib git g++ g++-multilib \
+               libclang-dev libunwind-dev \
+               nasm ninja-build \
+               openjdk-17-jdk-headless \
+               pkg-config wget
+      
       - name: Install flutter
         uses: subosito/flutter-action@v2
         with:
@@ -80,12 +113,6 @@ jobs:
         run: |
           cd $(dirname $(dirname $(which flutter)))
           [[ "3.24.5" == ${{env.ANDROID_FLUTTER_VERSION}} ]] && git apply ${{ github.workspace }}/.github/patches/flutter_3.24.4_dropdown_menu_enableFilter.diff
-      
-      - uses: nttld/setup-ndk@v1
-        id: setup-ndk
-        with:
-          ndk-version: ${{ env.NDK_VERSION }}
-          add-to-path: true
       
       - name: Restore bridge files
         uses: actions/download-artifact@master
@@ -108,38 +135,80 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          VCPKG_ROOT: /opt/artifacts/vcpkg
         run: |
+          echo "VCPKG_ROOT is set to: $VCPKG_ROOT"
           echo "Building dependencies for ${{ matrix.target-config.android_target }}"
-          ./flutter/build_android_deps.sh "${{ matrix.target-config.android_target }}" || {
-            echo "Failed to build dependencies"
+          
+          # 检查脚本是否存在
+          if [ -f "./flutter/build_android_deps.sh" ]; then
+            chmod +x ./flutter/build_android_deps.sh
+            ./flutter/build_android_deps.sh "${{ matrix.target-config.android_target }}" || {
+              echo "Failed to build dependencies"
+              exit 1
+            }
+          else
+            echo "Error: ./flutter/build_android_deps.sh not found!"
+            echo "Available files in flutter directory:"
+            ls -la flutter/ || true
             exit 1
-          }
+          fi
       
       - name: Build Rust library
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+          VCPKG_ROOT: /opt/artifacts/vcpkg
         run: |
+          echo "Building Rust library for ${{ matrix.target-config.target }}"
           rustup target add ${{ matrix.target-config.target }}
           cargo install cargo-ndk --version ${{ env.CARGO_NDK_VERSION }} --locked
           
           # 根据架构执行不同的构建脚本
           case "${{ matrix.target-config.target }}" in
             aarch64-linux-android)
-              ./flutter/ndk_arm64.sh
+              echo "Running ndk_arm64.sh"
+              chmod +x ./flutter/ndk_arm64.sh || echo "Warning: Cannot make ndk_arm64.sh executable"
+              ./flutter/ndk_arm64.sh || {
+                echo "Failed to run ndk_arm64.sh"
+                cat ./flutter/ndk_arm64.sh || true
+                exit 1
+              }
             ;;
             armv7-linux-androideabi)
-              ./flutter/ndk_arm.sh
+              echo "Running ndk_arm.sh"
+              chmod +x ./flutter/ndk_arm.sh || echo "Warning: Cannot make ndk_arm.sh executable"
+              ./flutter/ndk_arm.sh || {
+                echo "Failed to run ndk_arm.sh"
+                cat ./flutter/ndk_arm.sh || true
+                exit 1
+              }
             ;;
             x86_64-linux-android)
-              ./flutter/ndk_x64.sh
+              echo "Running ndk_x64.sh"
+              chmod +x ./flutter/ndk_x64.sh || echo "Warning: Cannot make ndk_x64.sh executable"
+              ./flutter/ndk_x64.sh || {
+                echo "Failed to run ndk_x64.sh"
+                cat ./flutter/ndk_x64.sh || true
+                exit 1
+              }
             ;;
           esac
           
-          # 复制库文件到 Flutter 目录
-          mkdir -p ./flutter/android/app/src/main/jniLibs/${{ matrix.target-config.android_target }}
-          cp ./target/${{ matrix.target-config.target }}/release/liblibrustdesk.so \
-             ./flutter/android/app/src/main/jniLibs/${{ matrix.target-config.android_target }}/librustdesk.so
+          # 检查库文件是否生成
+          echo "Checking if library was built..."
+          ls -la ./target/${{ matrix.target-config.target }}/release/ || true
+          
+          if [ -f "./target/${{ matrix.target-config.target }}/release/liblibrustdesk.so" ]; then
+            # 复制库文件到 Flutter 目录
+            mkdir -p ./flutter/android/app/src/main/jniLibs/${{ matrix.target-config.android_target }}
+            cp ./target/${{ matrix.target-config.target }}/release/liblibrustdesk.so \
+               ./flutter/android/app/src/main/jniLibs/${{ matrix.target-config.android_target }}/librustdesk.so
+            echo "Library copied successfully"
+          else
+            echo "Error: Library not found at ./target/${{ matrix.target-config.target }}/release/liblibrustdesk.so"
+            exit 1
+          fi
       
       - name: Build APK
         env:
@@ -149,24 +218,41 @@ jobs:
           export PATH=/usr/lib/jvm/java-17-openjdk-amd64/bin:$PATH
           
           # 设置 Gradle 内存限制
-          sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g" ./flutter/android/gradle.properties
+          if [ -f "./flutter/android/gradle.properties" ]; then
+            sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g" ./flutter/android/gradle.properties
+          fi
           
-          # 使用 debug 签名配置（因为没有签名密钥）
-          sed -i "s/signingConfigs.release/signingConfigs.debug/g" ./flutter/android/app/build.gradle
+          # 使用 debug 签名配置
+          if [ -f "./flutter/android/app/build.gradle" ]; then
+            sed -i "s/signingConfigs.release/signingConfigs.debug/g" ./flutter/android/app/build.gradle
+          fi
           
           # 复制必要的共享库
-          cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${{ matrix.target-config.target }}/libc++_shared.so \
-             ./flutter/android/app/src/main/jniLibs/${{ matrix.target-config.android_target }}/
+          if [ -d "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${{ matrix.target-config.target }}" ]; then
+            cp ${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${{ matrix.target-config.target }}/libc++_shared.so \
+               ./flutter/android/app/src/main/jniLibs/${{ matrix.target-config.android_target }}/ 2>/dev/null || echo "libc++_shared.so not found, continuing..."
+          fi
           
           # 构建 APK
+          echo "Building APK for ${{ matrix.target-config.platform }}"
           cd flutter
           flutter build apk --release \
             --target-platform ${{ matrix.target-config.platform }} \
             --split-per-abi
           
+          # 检查构建结果
+          echo "Build output:"
+          ls -la build/app/outputs/flutter-apk/ || true
+          
           # 重命名 APK 文件
-          mv build/app/outputs/flutter-apk/app-${{ matrix.target-config.android_target }}-release.apk \
-             ../rustdesk-${{ env.VERSION }}-${{ matrix.target-config.arch }}.apk
+          if [ -f "build/app/outputs/flutter-apk/app-${{ matrix.target-config.android_target }}-release.apk" ]; then
+            mv build/app/outputs/flutter-apk/app-${{ matrix.target-config.android_target }}-release.apk \
+               ../rustdesk-${{ env.VERSION }}-${{ matrix.target-config.arch }}.apk
+            echo "APK renamed successfully"
+          else
+            echo "Error: APK file not found!"
+            exit 1
+          fi
       
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
@@ -174,35 +260,4 @@ jobs:
           name: rustdesk-android-${{ matrix.target-config.arch }}
           path: rustdesk-${{ env.VERSION }}-${{ matrix.target-config.arch }}.apk
           retention-days: 7
-
-  create-release:
-    name: Create Release with APKs
-    needs: [build-android-all]
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Download all APK artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: apks
-      
-      - name: List downloaded files
-        run: ls -la apks/
-      
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: android-build-$(date +%Y%m%d-%H%M%S)
-          name: "Android Build $(date +%Y-%m-%d)"
-          body: |
-            Android APKs built from RustDesk
-            - Built at: $(date)
-            - Commit: ${{ github.sha }}
-            - Flutter: ${{ env.ANDROID_FLUTTER_VERSION }}
-            - Rust: ${{ env.RUST_VERSION }}
-          files: |
-            apks/**/*.apk
-          prerelease: true
-          generate_release_notes: false
+        if: success()
